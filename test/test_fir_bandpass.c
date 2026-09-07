@@ -385,6 +385,81 @@ static void test_tones(void) {
   }
 }
 
+/**
+ * @brief Check that FIR_BANDPASS_GROUP_DELAY is the alignment a caller needs.
+ *
+ * src/main.c sends the raw capture on one channel and the filtered signal on
+ * the other, and delays the raw one by FIR_BANDPASS_GROUP_DELAY samples so the
+ * two describe the same instant. That constant is the whole basis of the
+ * alignment, so this measures it rather than taking it on trust: for a signal
+ * that is entirely in the passband the filter is unity gain, so its output
+ * should be the input shifted by exactly that much and nothing else.
+ *
+ * Neighbouring shifts are measured too. A delay line that is one sample out is
+ * a plausible bug and an invisible one, so the test is not just that 108 fits
+ * but that 107 and 109 fit distinctly worse.
+ */
+static void test_group_delay_alignment(void) {
+  printf("Group delay alignment\n");
+
+  enum { SAMPLES = 4000 };
+  static float input[SAMPLES];
+  static float output[SAMPLES];
+
+  const fir_bandpass_spec_t spec = project_spec();
+  CHECK(fir_bandpass_init(&filter, &spec) == FIR_BANDPASS_OK, "designed");
+
+  /* Three tones well inside the passband, so the filter should do nothing to
+   * this but delay it. */
+  for (size_t n = 0u; n < (size_t)SAMPLES; n++) {
+    const double t = (double)n / SPEC_RATE;
+    input[n] = (float)((sin(2.0 * TEST_PI * 400.0 * t) +
+                        sin(2.0 * TEST_PI * 1000.0 * t) +
+                        sin(2.0 * TEST_PI * 2500.0 * t)) / 3.0);
+  }
+
+  fir_bandpass_reset(&filter);
+  for (size_t n = 0u; n < (size_t)SAMPLES; n++) {
+    output[n] = fir_bandpass_tick(&filter, input[n]);
+  }
+
+  /* Well past the filter filling up, so only the steady state is measured. */
+  const size_t first = (size_t)FIR_BANDPASS_TAPS + 200u;
+
+  double best_db = 1000.0;
+  long best_delay = -1;
+  double at_group_delay_db = 0.0;
+  double at_neighbour_db = -1000.0;
+
+  for (long delay = FIR_BANDPASS_GROUP_DELAY - 3; delay <= FIR_BANDPASS_GROUP_DELAY + 3;
+       delay++) {
+    double residual = 0.0;
+    double signal = 0.0;
+    for (size_t n = first; n < (size_t)SAMPLES; n++) {
+      const double want = (double)input[n - (size_t)delay];
+      const double got = (double)output[n];
+      residual += (got - want) * (got - want);
+      signal += want * want;
+    }
+    const double db = 10.0 * log10((residual / signal) + 1.0e-300);
+    printf("        delay %3ld samples : residual %+7.2f dB\n", delay, db);
+
+    if (db < best_db) { best_db = db; best_delay = delay; }
+    if (delay == FIR_BANDPASS_GROUP_DELAY) {
+      at_group_delay_db = db;
+    } else if (labs(delay - FIR_BANDPASS_GROUP_DELAY) == 1 && db > at_neighbour_db) {
+      at_neighbour_db = db;
+    }
+  }
+
+  CHECK(best_delay == FIR_BANDPASS_GROUP_DELAY,
+        "the best alignment is exactly FIR_BANDPASS_GROUP_DELAY samples");
+  CHECK(at_group_delay_db < -45.0,
+        "at that alignment the filtered signal is the delayed input, to -45 dB");
+  CHECK(at_neighbour_db - at_group_delay_db > 20.0,
+        "being one sample out is at least 20 dB worse, so an off-by-one shows");
+}
+
 static void test_other_bands(void) {
   printf("Other bands in the same build\n");
 
@@ -427,6 +502,7 @@ int main(void) {
   test_impulse_response();
   test_streaming();
   test_tones();
+  test_group_delay_alignment();
   test_other_bands();
 
   printf("\n%s\n", failures == 0 ? "ALL FIR TESTS PASSED" : "SOME FIR TESTS FAILED");

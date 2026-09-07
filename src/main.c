@@ -12,9 +12,17 @@
  *        |
  *    capture_buffer           -2048 .. +2047, signed
  *        |
- *    [ filter, gain stage, AGC ]        NOT WRITTEN YET
- *        |
  *    scale to full scale int16          x16, so the host reads real levels
+ *        |
+ *        +----------------------------------+
+ *        |                                  |
+ *    delay 108 samples                  FIR bandpass        300 Hz .. 3000 Hz
+ *        |                                  |
+ *    channel 1, raw                     channel 2, filtered
+ *        |                                  |
+ *        +----------------------------------+
+ *        |
+ *    [ gain stage, AGC ]                NOT WRITTEN YET
  *        |
  *    frame_audio / frame_telem          the provided framing library
  *        |
@@ -32,10 +40,18 @@
  *  interrupt the second, and the ADC fills the other one meanwhile. Nothing
  *  stops, so capture runs indefinitely on 250 interrupts a second.
  *
- *  Processing. Not written yet. Until it is, the captured block is sent as
- *  both channels, so the two halves of the stereo capture are identical, and
- *  gain_db and the two RMS levels in the telemetry record read zero. The
- *  counters in that record are real.
+ *  Processing. The bandpass from fir_bandpass.h, and nothing else yet. The
+ *  gain stage and the AGC loop are still missing, so gain_db and the two RMS
+ *  levels in the telemetry record still read zero; the counters in that record
+ *  are real, and worst_block_cycles now includes the filter.
+ *
+ *  Delay matching. The filter delays every frequency alike, by
+ *  FIR_BANDPASS_GROUP_DELAY samples - 108, which is 13.5 ms at 8 kHz. The raw
+ *  channel goes through a delay line of exactly that length before it is
+ *  framed, so the two channels of the host's stereo_capture.wav line up sample
+ *  for sample. Without it they would be 108 samples out of step, and anything
+ *  comparing them - a level detector, the host, an ear - would be comparing
+ *  different moments.
  *
  *  Streaming. Audio frames go out once per block and status records 20 times
  *  a second, together about 37% of the link. This file is the ring buffer's
@@ -54,6 +70,7 @@
 #include "assert_custom.h"
 #include "board.h"
 
+#include "fir_bandpass.h"
 #include "framing.h"
 #include "instrument.h"
 #include "ringbuf.h"
@@ -86,6 +103,20 @@
 /** ADC resolution, and the half scale count the offset unit removes. */
 #define ADC_RESOLUTION_BITS (12)
 #define ADC_HALF_SCALE (1U << (ADC_RESOLUTION_BITS - 1))
+
+/**
+ * The band, from the brief: 300 Hz to 3000 Hz, 150 Hz skirts, 60 dB down.
+ *
+ * The skirts sit outside the passband, so everything from 300 Hz to 3000 Hz
+ * passes at unity and the stopbands begin at 150 Hz and 3150 Hz. The tap count
+ * follows from these and is fixed at compile time; FIR_BANDPASS_TAPS defaults
+ * to exactly what this spec needs, and fir_bandpass_init() refuses the spec
+ * rather than under-delivering if it ever does not.
+ */
+#define FILTER_PASS_LOW_HZ (300.0f)
+#define FILTER_PASS_HIGH_HZ (3000.0f)
+#define FILTER_SKIRT_HZ (150.0f)
+#define FILTER_STOPBAND_DB (60.0f)
 
 // =================
 // === machinery ===
@@ -179,6 +210,66 @@ void HAL_ADC_ErrorCallback(ADC_HandleTypeDef* hadc) {
   if (0 != (hadc->ErrorCode & HAL_ADC_ERROR_OVR)) {
     g_counters.adc_overruns++;
   }
+}
+
+/**
+ * The bandpass. Designed once in main() before capture starts, and after that
+ * touched only by the block loop, so it needs no guarding.
+ */
+static fir_bandpass_t bandpass;
+
+/**
+ * The raw channel's delay line, exactly as long as the filter's group delay.
+ *
+ * 108 int16 samples, 216 bytes. A plain circular buffer: the sample that falls
+ * out is the one pushed in FIR_BANDPASS_GROUP_DELAY samples ago, which is the
+ * same instant the filter is emitting on the other channel.
+ */
+static int16_t raw_delay[FIR_BANDPASS_GROUP_DELAY];
+static size_t raw_delay_index = 0;
+
+/**
+ * @brief Push a sample into the raw delay line and take out the matching one.
+ *
+ * @param sample Sample to delay.
+ * @return The sample from FIR_BANDPASS_GROUP_DELAY calls ago; zero until the
+ *         line has filled, which is the same startup transient the filter has.
+ */
+static inline int16_t raw_delay_push(int16_t sample) {
+  const int16_t delayed = raw_delay[raw_delay_index];
+  raw_delay[raw_delay_index] = sample;
+  raw_delay_index = (raw_delay_index + 1u < FIR_BANDPASS_GROUP_DELAY)
+                        ? raw_delay_index + 1u
+                        : 0u;
+  return delayed;
+}
+
+/**
+ * @brief Put a filtered sample on the wire, saturating rather than wrapping.
+ *
+ * The filter is unity gain to a sine in the passband, but its worst-case gain
+ * to an arbitrary waveform is the sum of the magnitudes of its coefficients,
+ * which for this band is 2.92 - about 9.3 dB above full scale. Real audio does
+ * not go near that, but a signal that did would wrap to the opposite rail
+ * without this, turning an overload into something that sounds like noise
+ * rather than like clipping.
+ *
+ * @param value Filtered sample, already scaled to the wire's full scale.
+ * @return The sample as int16, clamped to the representable range.
+ */
+static inline int16_t saturate_i16(float value) {
+  if (value >= (float)INT16_MAX) {
+    return INT16_MAX;
+  }
+  if (value <= (float)INT16_MIN) {
+    return INT16_MIN;
+  }
+  /* Rounded half away from zero, by hand. lrintf() would be a call into newlib
+   * on every sample - the compiler has to assume a math function might set
+   * errno, so it will not reduce it to the single VCVTR the FPU has. The
+   * clamps above are what make this safe: the largest value that reaches here
+   * is just under 32767, so adding a half cannot carry it out of range. */
+  return (int16_t)(value + ((value >= 0.0f) ? 0.5f : -0.5f));
 }
 
 /**
@@ -531,6 +622,30 @@ int main(void) {
 
   {
     /**
+     * @section Design the bandpass.
+     *
+     * Before capture starts, not after: the design evaluates a few hundred
+     * double-precision sines and takes milliseconds, which is long enough that
+     * blocks would arrive and be dropped while it ran. It allocates nothing -
+     * the coefficients land in the static above.
+     *
+     * A refusal here is a bug in the constants, not a runtime condition, so it
+     * traps. FIR_BANDPASS_OK is zero, which is what ERROR_CHECK tests for.
+     */
+    fir_bandpass_spec_t filter_spec;
+    memset(&filter_spec, 0, sizeof(fir_bandpass_spec_t));
+
+    filter_spec.sample_rate_hz = (float)SAMPLE_RATE_HZ;
+    filter_spec.pass_low_hz = FILTER_PASS_LOW_HZ;
+    filter_spec.pass_high_hz = FILTER_PASS_HIGH_HZ;
+    filter_spec.transition_hz = FILTER_SKIRT_HZ;
+    filter_spec.stopband_db = FILTER_STOPBAND_DB;
+
+    ERROR_CHECK(fir_bandpass_init(&bandpass, &filter_spec));
+  }
+
+  {
+    /**
      * @section Start capture.
      *
      * The ADC has to be armed before the timer starts, otherwise the first
@@ -550,8 +665,10 @@ int main(void) {
   }
 
   /* Frame staging. One audio frame is the larger of the two, so it serves
-   * for both. Static, like everything else here. */
-  static int16_t stream_block[CAPTURE_BLOCK_SAMPLES];
+   * for both. Static, like everything else here. The two channels are staged
+   * separately because frame_audio() interleaves them itself. */
+  static int16_t stream_raw[CAPTURE_BLOCK_SAMPLES];
+  static int16_t stream_filtered[CAPTURE_BLOCK_SAMPLES];
   static uint8_t stream_frame[AUDIO_FRAME_BYTES];
 
   uint32_t sequence = 0;
@@ -569,21 +686,34 @@ int main(void) {
       capture_block_ready = false;
 
       BLOCK_TIMER_START();
-      /* The filter, the gain stage and the AGC loop belong here. Until they
-      * exist the captured block is sent as both channels, so the two halves of
-      * the stereo capture are identical and the link can be judged on its own.
+      /* The gain stage and the AGC loop still belong here, after the filter.
       *
       * The conversion result is 12 bit signed and the host reads samples as
-      * int16, so it is scaled to full scale on the way out. Without this every
+      * int16, so it is scaled to full scale on the way in. Without this every
       * level the host reports would be 24 dB low, which would make the trim pot
       * calibration in the brief actively misleading. Multiply rather than
-      * shift: a left shift of a negative value is not defined before C23. */
+      * shift: a left shift of a negative value is not defined before C23.
+      *
+      * Scaling before the filter rather than after keeps the two channels on
+      * one scale factor, and costs nothing: the filter is linear, so where the
+      * multiply happens makes no difference to what comes out.
+      *
+      * The residual DC the ADC's offset unit leaves behind needs no separate
+      * handling. The filter is 65 dB down at DC, so it removes it - but only
+      * from channel 2. Channel 1 is the raw capture and keeps whatever offset
+      * the hardware left on it, which is the point of having it. */
       for (size_t idx = 0; idx < CAPTURE_BLOCK_SAMPLES; idx++) {
-        stream_block[idx] = (int16_t)(block[idx] * 16);
+        const int16_t raw = (int16_t)(block[idx] * 16);
+        const float filtered = fir_bandpass_tick(&bandpass, (float)raw);
+
+        /* Delayed by exactly the filter's group delay, so the two channels
+         * leave the board describing the same instant. */
+        stream_raw[idx] = raw_delay_push(raw);
+        stream_filtered[idx] = saturate_i16(filtered);
       }
 
       const size_t audio_bytes = frame_audio(stream_frame, sizeof(stream_frame),
-                                            sequence, stream_block, stream_block);
+                                            sequence, stream_raw, stream_filtered);
       BLOCK_TIMER_END();
 
       sequence++;

@@ -10,10 +10,11 @@ a ping-pong buffer; each block is framed by the provided library and sent to
 the host over the ST-LINK virtual com port at 921600 baud, with a status record
 20 times a second. `host/host_receive.py` works against it as-is.
 
-The bandpass filter is written and tested (`inc/fir_bandpass.h`) but is not
-wired into the audio path yet, so the gain stage and the AGC loop are still
-missing: both channels of the capture carry the same raw samples and `gain_db`
-/ `rms_in_dbfs` / `rms_out_dbfs` report zero. The counters are real.
+Capture, filter and stream. The bandpass is in the audio path: channel 1 of
+`stereo_capture.wav` is the raw capture and channel 2 is the filtered signal,
+delay-matched so the two line up sample for sample. The gain stage and the AGC
+loop are still missing, so `gain_db` / `rms_in_dbfs` / `rms_out_dbfs` report
+zero. The counters are real, and `worst_block_cycles` now includes the filter.
 
 ## Hardware
 
@@ -131,14 +132,27 @@ host/  host_receive.py                    provided receiver
   skirts, 60 dB down - it takes 217 taps and measures a flat passband to
   within 0.01 dB with the worst stopband point at -65.5 dB.
 
-  Two things about it are worth knowing before it goes into the audio path.
   The textbook Kaiser tap count for that spec is 195, and 195 taps measures
   -58.8 dB, not -60: Kaiser's estimate is derived for a lowpass, and a
   bandpass has two error terms that can add. The library designs for 6 dB more
-  than asked to cover that, which is where 217 comes from. And the filter
-  delays the signal by 108 samples, 13.5 ms, at every frequency alike - so an
-  AGC comparing input level against output level has to line the two up by
-  that much or it is comparing different moments.
+  than asked to cover that, which is where 217 comes from.
+
+- **Delay matching.** The filter delays every frequency alike by 108 samples,
+  13.5 ms. `main.c` runs the raw channel through a delay line of exactly that
+  length before framing it, so the two channels of `stereo_capture.wav`
+  describe the same instant - otherwise comparing them, by ear or by the host
+  or by a level detector, compares two different moments. The alignment is
+  measured rather than assumed: `test_fir_bandpass.c` sweeps the shift and
+  checks that 108 is where an in-band signal reconstructs to -78 dB and that
+  107 and 109 are both far worse, so an off-by-one cannot pass quietly.
+
+- **Clipping.** The filter is unity gain to a tone in the passband, but its
+  worst-case gain to an arbitrary waveform is the sum of the magnitudes of its
+  coefficients, which for this band is 2.92 - about 9.3 dB above full scale.
+  Real audio does not go near that, but `main.c` saturates the filtered channel
+  rather than letting it wrap, so an overload sounds like clipping instead of
+  like noise. Nothing counts those saturations yet; that belongs with the gain
+  stage.
 
 - **Aliasing.** Worth flagging: at 8 kHz Nyquist is 4 kHz, and there is no
   analogue anti-alias filter between the MAX4466 and the ADC. The high tone in

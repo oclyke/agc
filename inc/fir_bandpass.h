@@ -67,10 +67,13 @@
  *  of which 1736 is the sample history and 868 of that is the second copy the
  *  contiguous window costs.
  *
- *  CPU, per sample: 109 multiply-accumulates and 108 adds. At 8 kHz that is
- *  under a million multiply-accumulates a second, which on a 170 MHz
- *  Cortex-M4F should land near 3% of the CPU - ESTIMATED, not measured. Time
- *  it with the DWT counter in instrument.h before quoting it.
+ *  CPU, per sample: 109 multiply-accumulates and 108 adds. GCC 13 compiles the
+ *  folded loop to eight instructions a tap - three post-indexed loads, the add
+ *  of the symmetric pair, the multiply, the accumulate, and the loop test - so
+ *  at 8 kHz on a 170 MHz Cortex-M4F expect somewhere around 5 to 7% of the
+ *  CPU. That is READ OFF THE DISASSEMBLY, not measured. The firmware times the
+ *  real thing with the DWT counter and reports it as worst_block_cycles in the
+ *  telemetry record; trust that number over this paragraph.
  *
  *  Flash: about 2.8 KB for this file, plus about 13 KB of newlib's
  *  double-precision math - pow, and the argument reduction behind sin and cos
