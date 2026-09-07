@@ -16,13 +16,15 @@
  *        |
  *        +----------------------------------+
  *        |                                  |
- *    delay 108 samples                  FIR bandpass        300 Hz .. 3000 Hz
+ *    delay 172 samples                  FIR bandpass        300 Hz .. 3000 Hz
  *        |                                  |
- *    channel 1, raw                     channel 2, filtered
+ *        |                              AGC                 block RMS to -20 dBFS,
+ *        |                                  |               one block of lookahead
+ *        |                              saturate to int16
+ *        |                                  |
+ *    channel 1, raw                     channel 2, processed
  *        |                                  |
  *        +----------------------------------+
- *        |
- *    [ gain stage, AGC ]                NOT WRITTEN YET
  *        |
  *    frame_audio / frame_telem          the provided framing library
  *        |
@@ -40,18 +42,22 @@
  *  interrupt the second, and the ADC fills the other one meanwhile. Nothing
  *  stops, so capture runs indefinitely on 250 interrupts a second.
  *
- *  Processing. The bandpass from fir_bandpass.h, and nothing else yet. The
- *  gain stage and the AGC loop are still missing, so gain_db and the two RMS
- *  levels in the telemetry record still read zero; the counters in that record
- *  are real, and worst_block_cycles now includes the filter.
+ *  Processing. The bandpass from fir_bandpass.h, then the loop from agc.h. The
+ *  filter runs per sample; the loop runs per block, measuring the block's RMS
+ *  and scaling the PREVIOUS block along a straight line ending at the gain
+ *  this one asked for. Gain reductions are applied at once and recoveries take
+ *  50 ms, and what multiplies the samples is held between -20 and +40 dB.
+ *  Everything in the telemetry record is now real.
  *
- *  Delay matching. The filter delays every frequency alike, by
- *  FIR_BANDPASS_GROUP_DELAY samples - 108, which is 13.5 ms at 8 kHz. The raw
- *  channel goes through a delay line of exactly that length before it is
- *  framed, so the two channels of the host's stereo_capture.wav line up sample
- *  for sample. Without it they would be 108 samples out of step, and anything
- *  comparing them - a level detector, the host, an ear - would be comparing
- *  different moments.
+ *  Delay matching. Two delays have to be made up on the raw channel, not one.
+ *  The filter delays every frequency alike by FIR_BANDPASS_GROUP_DELAY samples
+ *  - 108, which is 13.5 ms at 8 kHz - and the AGC holds a block back so its
+ *  ramp can be aimed by the block that follows, which is another 64 samples.
+ *  The raw channel goes through a delay line of exactly 172 samples before it
+ *  is framed, so the two channels of the host's stereo_capture.wav line up
+ *  sample for sample. Without it they would be 172 samples out of step, and
+ *  anything comparing them - a level detector, the host, an ear - would be
+ *  comparing different moments.
  *
  *  Streaming. Audio frames go out once per block and status records 20 times
  *  a second, together about 37% of the link. This file is the ring buffer's
@@ -70,6 +76,7 @@
 #include "assert_custom.h"
 #include "board.h"
 
+#include "agc.h"
 #include "fir_bandpass.h"
 #include "framing.h"
 #include "instrument.h"
@@ -77,6 +84,7 @@
 
 #include "stm32g4xx_hal.h"
 
+#include <math.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -118,12 +126,42 @@
 #define FILTER_SKIRT_HZ (150.0f)
 #define FILTER_STOPBAND_DB (60.0f)
 
+/**
+ * The loop, from the brief: hold roughly -20 dBFS RMS, and clamp the gain
+ * between -20 dB and +40 dB so it cannot run away during silence.
+ *
+ * The brief suggests something like 10 ms down and 150 ms up. This goes
+ * further in both directions: reductions are applied in full immediately -
+ * there is no attack time constant at all, because the loop has a block of
+ * lookahead and can finish the ramp before the loud audio arrives - and
+ * recoveries take 50 ms, which is quick enough to lift the tail of a word
+ * without lunging at the room noise between them.
+ *
+ * Full scale is 32768 rather than 32767: it is the amplitude that 0 dBFS
+ * names, not the largest int16, and using the latter would put every level
+ * reported 0.0003 dB out for no reason.
+ */
+#define AGC_FULL_SCALE (32768.0f)
+#define AGC_TARGET_DBFS (-20.0f)
+#define AGC_MIN_GAIN_DB (-20.0f)
+#define AGC_MAX_GAIN_DB (40.0f)
+#define AGC_RELEASE_TAU_S (0.050f)
+
+/** Floor for a level reported over the wire, so log10f never sees zero. */
+#define TELEMETRY_LEVEL_FLOOR_DBFS (-120.0f)
+
 // =================
 // === machinery ===
 
 /** One block of samples, sized to match the wire format in framing.h. */
 #define CAPTURE_BLOCK_SAMPLES (BLOCK_SAMPLES)
 #define CAPTURE_BUFFER_SAMPLES (2 * CAPTURE_BLOCK_SAMPLES)
+
+/* agc.h fixes its block size at compile time and sizes its buffer from it, so
+ * a mismatch would overrun rather than misbehave. Both default to 64; this
+ * catches an override of one without the other. */
+static_assert(AGC_BLOCK_SAMPLES == CAPTURE_BLOCK_SAMPLES,
+              "the AGC block size must match the capture block size");
 
 /** Blocks between heartbeat toggles, so the LED runs at a visible 0.5 Hz. */
 #define HEARTBEAT_BLOCKS (SAMPLE_RATE_HZ / CAPTURE_BLOCK_SAMPLES)
@@ -219,49 +257,76 @@ void HAL_ADC_ErrorCallback(ADC_HandleTypeDef* hadc) {
 static fir_bandpass_t bandpass;
 
 /**
- * The raw channel's delay line, exactly as long as the filter's group delay.
- *
- * 108 int16 samples, 216 bytes. A plain circular buffer: the sample that falls
- * out is the one pushed in FIR_BANDPASS_GROUP_DELAY samples ago, which is the
- * same instant the filter is emitting on the other channel.
+ * The loop from agc.h. Set up once in main() before capture starts, and after
+ * that touched only by the block loop, so it needs no guarding.
  */
-static int16_t raw_delay[FIR_BANDPASS_GROUP_DELAY];
+static agc_t agc;
+
+/**
+ * The raw channel's delay line: the filter's group delay, plus the block the
+ * AGC holds back.
+ *
+ * 172 int16 samples, 344 bytes, 21.5 ms. A plain circular buffer: the sample
+ * that falls out is the one pushed in RAW_DELAY_SAMPLES samples ago, which is
+ * the same instant the processed channel is describing.
+ */
+#define RAW_DELAY_SAMPLES (FIR_BANDPASS_GROUP_DELAY + CAPTURE_BLOCK_SAMPLES)
+
+static int16_t raw_delay[RAW_DELAY_SAMPLES];
 static size_t raw_delay_index = 0;
 
 /**
  * @brief Push a sample into the raw delay line and take out the matching one.
  *
  * @param sample Sample to delay.
- * @return The sample from FIR_BANDPASS_GROUP_DELAY calls ago; zero until the
- *         line has filled, which is the same startup transient the filter has.
+ * @return The sample from RAW_DELAY_SAMPLES calls ago; zero until the line has
+ *         filled, which is the same startup transient the filter has.
  */
 static inline int16_t raw_delay_push(int16_t sample) {
   const int16_t delayed = raw_delay[raw_delay_index];
   raw_delay[raw_delay_index] = sample;
-  raw_delay_index = (raw_delay_index + 1u < FIR_BANDPASS_GROUP_DELAY)
+  raw_delay_index = (raw_delay_index + 1u < RAW_DELAY_SAMPLES)
                         ? raw_delay_index + 1u
                         : 0u;
   return delayed;
 }
 
 /**
- * @brief Put a filtered sample on the wire, saturating rather than wrapping.
+ * Samples the saturation below has had to hold at a rail.
  *
- * The filter is unity gain to a sine in the passband, but its worst-case gain
- * to an arbitrary waveform is the sum of the magnitudes of its coefficients,
- * which for this band is 2.92 - about 9.3 dB above full scale. Real audio does
- * not go near that, but a signal that did would wrap to the opposite rail
- * without this, turning an overload into something that sounds like noise
- * rather than like clipping.
+ * There is no field for this in the telemetry record - PROTOCOL.md fixes the
+ * layout and host_receive.py parses it - so it does not reach the host. Read
+ * it under a debugger, or look for the flat tops it counts in channel 2 of
+ * stereo_capture.wav. Volatile so it survives -O2 with nothing reading it.
+ */
+static volatile uint32_t output_clips = 0;
+
+/**
+ * @brief Put a processed sample on the wire, saturating rather than wrapping.
  *
- * @param value Filtered sample, already scaled to the wire's full scale.
+ * Two things upstream can push a sample past full scale. The filter is unity
+ * gain to a sine in the passband, but its worst-case gain to an arbitrary
+ * waveform is the sum of the magnitudes of its coefficients, which for this
+ * band is 2.92 - about 9.3 dB above full scale. Real audio does not go near
+ * that. The AGC is the likelier source: it aims a gain at an RMS level, so any
+ * crest factor at all puts peaks above the target, and a signal that gets loud
+ * faster than the loop's one block of lookahead can see will overshoot until
+ * the next block pulls the gain down.
+ *
+ * Either way, a sample past the rail would wrap to the opposite one without
+ * this, turning an overload into something that sounds like noise rather than
+ * like clipping. The brief asks for saturation specifically.
+ *
+ * @param value Processed sample, already scaled to the wire's full scale.
  * @return The sample as int16, clamped to the representable range.
  */
 static inline int16_t saturate_i16(float value) {
   if (value >= (float)INT16_MAX) {
+    output_clips++;
     return INT16_MAX;
   }
   if (value <= (float)INT16_MIN) {
+    output_clips++;
     return INT16_MIN;
   }
   /* Rounded half away from zero, by hand. lrintf() would be a call into newlib
@@ -270,6 +335,29 @@ static inline int16_t saturate_i16(float value) {
    * clamps above are what make this safe: the largest value that reaches here
    * is just under 32767, so adding a half cannot carry it out of range. */
   return (int16_t)(value + ((value >= 0.0f) ? 0.5f : -0.5f));
+}
+
+/**
+ * @brief Turn a ratio into decibels, for the telemetry record.
+ *
+ * Called three times per telemetry frame - sixty times a second - and never in
+ * the audio path, which is where a log10f belongs: it is a newlib call the
+ * single-precision FPU cannot do much for.
+ *
+ * Levels arrive here already divided by full scale, so the same function
+ * serves for a level in dBFS and for the gain in dB. The floor is what keeps
+ * silence reporting a number instead of -inf, which would reach the host as a
+ * NaN-adjacent float and land in the CSV as `-inf`.
+ *
+ * @param ratio Amplitude relative to full scale, or a gain. Non-negative.
+ * @return 20*log10(ratio), floored at TELEMETRY_LEVEL_FLOOR_DBFS.
+ */
+static float to_db(float ratio) {
+  if (ratio <= 0.0f) {
+    return TELEMETRY_LEVEL_FLOOR_DBFS;
+  }
+  const float db = 20.0f * log10f(ratio);
+  return (db > TELEMETRY_LEVEL_FLOOR_DBFS) ? db : TELEMETRY_LEVEL_FLOOR_DBFS;
 }
 
 /**
@@ -646,6 +734,40 @@ int main(void) {
 
   {
     /**
+     * @section Set up the AGC.
+     *
+     * Cheap - a couple of powf calls - but it belongs here beside the filter
+     * design rather than in the block loop, and it has to happen before the
+     * first block arrives either way.
+     *
+     * The warmup is the filter's, not the loop's. fir_bandpass.h is explicit
+     * that the first FIR_BANDPASS_TAPS outputs after an init are the history
+     * filling up and are not meaningful, and 217 samples is four blocks at
+     * this block size. Measuring them would read a fraction of the real level,
+     * ask for the +40 dB ceiling, and amplify the fill transient; the first
+     * genuine block would then snap the gain back down. It is a third of a
+     * second of nonsense at startup that costs one field to avoid.
+     *
+     * A refusal here is a bug in the constants above, not a runtime condition,
+     * so it traps. AGC_OK is zero, which is what ERROR_CHECK tests for.
+     */
+    agc_spec_t agc_spec;
+    memset(&agc_spec, 0, sizeof(agc_spec_t));
+
+    agc_spec.full_scale = AGC_FULL_SCALE;
+    agc_spec.target_rms_dbfs = AGC_TARGET_DBFS;
+    agc_spec.min_gain_db = AGC_MIN_GAIN_DB;
+    agc_spec.max_gain_db = AGC_MAX_GAIN_DB;
+    agc_spec.release_alpha = agc_release_alpha(AGC_RELEASE_TAU_S,
+                                               (float)SAMPLE_RATE_HZ);
+    agc_spec.warmup_blocks = (FIR_BANDPASS_TAPS + CAPTURE_BLOCK_SAMPLES - 1u)
+                             / CAPTURE_BLOCK_SAMPLES;
+
+    ERROR_CHECK(agc_init(&agc, &agc_spec));
+  }
+
+  {
+    /**
      * @section Start capture.
      *
      * The ADC has to be armed before the timer starts, otherwise the first
@@ -666,10 +788,27 @@ int main(void) {
 
   /* Frame staging. One audio frame is the larger of the two, so it serves
    * for both. Static, like everything else here. The two channels are staged
-   * separately because frame_audio() interleaves them itself. */
+   * separately because frame_audio() interleaves them itself.
+   *
+   * The two float buffers are the gain stage's working space: the filter's
+   * output on the way in, and the AGC's output - the previous block, ramped -
+   * on the way back. They stay float so the signal is quantised once, at
+   * saturate_i16() on the wire, rather than twice with the gain applied in
+   * between. agc_process() reads one and writes the other, so they must be
+   * separate buffers. */
   static int16_t stream_raw[CAPTURE_BLOCK_SAMPLES];
-  static int16_t stream_filtered[CAPTURE_BLOCK_SAMPLES];
+  static int16_t stream_processed[CAPTURE_BLOCK_SAMPLES];
   static uint8_t stream_frame[AUDIO_FRAME_BYTES];
+  static float block_filtered[CAPTURE_BLOCK_SAMPLES];
+  static float block_gained[CAPTURE_BLOCK_SAMPLES];
+
+  /* Latched once a block, read by the telemetry section 20 times a second.
+   * Both live in this loop, so there is no interrupt to synchronise against.
+   * Levels are amplitudes on the wire's scale; the conversion to dB happens
+   * where the record is built, to keep log10f out of the audio path. */
+  static float telem_gain = 1.0f;
+  static float telem_rms_in = 0.0f;
+  static float telem_rms_out = 0.0f;
 
   uint32_t sequence = 0;
   uint32_t telemetry_due_ms = HAL_GetTick();
@@ -686,38 +825,66 @@ int main(void) {
       capture_block_ready = false;
 
       BLOCK_TIMER_START();
-      /* The gain stage and the AGC loop still belong here, after the filter.
+      /* Capture, scaling and the filter, one sample at a time.
       *
       * The conversion result is 12 bit signed and the host reads samples as
       * int16, so it is scaled to full scale on the way in. Without this every
       * level the host reports would be 24 dB low, which would make the trim pot
-      * calibration in the brief actively misleading. Multiply rather than
-      * shift: a left shift of a negative value is not defined before C23.
+      * calibration in the brief actively misleading - and it would put the
+      * AGC's measurement on a different scale from its target. Multiply rather
+      * than shift: a left shift of a negative value is not defined before C23.
       *
       * Scaling before the filter rather than after keeps the two channels on
       * one scale factor, and costs nothing: the filter is linear, so where the
       * multiply happens makes no difference to what comes out.
       *
       * The residual DC the ADC's offset unit leaves behind needs no separate
-      * handling. The filter is 65 dB down at DC, so it removes it - but only
-      * from channel 2. Channel 1 is the raw capture and keeps whatever offset
-      * the hardware left on it, which is the point of having it. */
+      * handling. The filter is 65 dB down at DC, so it removes it - which is
+      * what makes the RMS the AGC measures a level rather than a level plus an
+      * offset. Channel 1 is the raw capture and keeps whatever offset the
+      * hardware left on it, which is the point of having it. */
       for (size_t idx = 0; idx < CAPTURE_BLOCK_SAMPLES; idx++) {
         const int16_t raw = (int16_t)(block[idx] * 16);
-        const float filtered = fir_bandpass_tick(&bandpass, (float)raw);
 
-        /* Delayed by exactly the filter's group delay, so the two channels
-         * leave the board describing the same instant. */
+        block_filtered[idx] = fir_bandpass_tick(&bandpass, (float)raw);
+
+        /* Delayed by the filter's group delay AND by the block the AGC is
+         * about to hold back, so the two channels leave the board describing
+         * the same instant. */
         stream_raw[idx] = raw_delay_push(raw);
-        stream_filtered[idx] = saturate_i16(filtered);
       }
 
-      const size_t audio_bytes = frame_audio(stream_frame, sizeof(stream_frame),
-                                            sequence, stream_raw, stream_filtered);
+      size_t audio_bytes = 0;
+
+      /* In goes this block, out comes the previous one, ramped towards the
+       * gain this one asked for. Nothing is emitted for the very first block
+       * of the run - there is no previous block to scale yet - so the frame
+       * that would have carried it is simply never built, and the sequence
+       * numbering the host checks starts at the first frame that is. */
+      if (agc_process(&agc, block_filtered, block_gained)) {
+        float sum_sq = 0.0f;
+
+        for (size_t idx = 0; idx < CAPTURE_BLOCK_SAMPLES; idx++) {
+          const int16_t sample = saturate_i16(block_gained[idx]);
+          stream_processed[idx] = sample;
+          /* Measured after saturation, so rms_out_dbfs is the level of what
+           * actually went out rather than of what the gain asked for. */
+          sum_sq += (float)sample * (float)sample;
+        }
+
+        telem_gain = agc_gain(&agc);
+        telem_rms_in = agc_input_rms(&agc);
+        telem_rms_out = sqrtf(sum_sq / (float)CAPTURE_BLOCK_SAMPLES);
+
+        audio_bytes = frame_audio(stream_frame, sizeof(stream_frame),
+                                  sequence, stream_raw, stream_processed);
+      }
       BLOCK_TIMER_END();
 
-      sequence++;
-      stream_send(stream_frame, audio_bytes);
+      if (0 != audio_bytes) {
+        sequence++;
+        stream_send(stream_frame, audio_bytes);
+      }
     }
 
     /**
@@ -732,8 +899,24 @@ int main(void) {
         memset(&telemetry, 0, sizeof(telem_t));
 
         telemetry.timestamp_ms = now_ms;
-        /* gain_db and the two RMS levels stay zero until there is a gain stage
-        * to report. The counters below are real. */
+        /* All three describe the block the AGC last emitted, so they line up
+        * with each other and with the audio frame that carried it.
+        *
+        * rms_in is measured at the loop's own measurement point - after the
+        * filter, before the gain - not on channel 1. Channel 1 still holds the
+        * rumble, the alias and the residual DC, and subtracting a level that
+        * includes those from the output level would not give back the gain.
+        * Measured this way it does: rms_out - rms_in is gain_db in the steady
+        * state, and the two separate exactly when the loop is moving, which is
+        * the interesting part of the plot.
+        *
+        * They separate for two reasons, both deliberate. The block was scaled
+        * by a ramp rather than by a constant, so its output level reflects the
+        * whole line and gain_db is only where that line finished; and the line
+        * was aimed by the block AFTER this one, which is the lookahead. */
+        telemetry.gain_db = to_db(telem_gain);
+        telemetry.rms_in_dbfs = to_db(telem_rms_in / AGC_FULL_SCALE);
+        telemetry.rms_out_dbfs = to_db(telem_rms_out / AGC_FULL_SCALE);
         telemetry.worst_block_cycles = g_counters.worst_cycles;
         telemetry.dma_overruns = g_counters.dma_overruns;
         telemetry.adc_overruns = g_counters.adc_overruns;

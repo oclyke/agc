@@ -29,7 +29,7 @@ FW_LD    := src/linker.ld
 # Ours. Built with warnings as errors.
 FW_SRC := src/main.c src/interrupt.c src/syscalls.c \
           src/framing.c src/ringbuf.c src/instrument.c \
-          src/fir_bandpass.c
+          src/fir_bandpass.c src/agc.c
 
 # Third-party. Does not compile clean under -Werror, so it is built without it.
 FW_TP_SRC := \
@@ -69,9 +69,10 @@ FW_LDFLAGS := $(FW_MCU) $(FW_OPT) -T $(FW_LD) \
               --specs=nano.specs -nostartfiles \
               -Wl,--gc-sections -Wl,-Map=$(FW_BUILD)/firmware.map
 
-# The filter design needs sin, cos and pow. Newlib's libm neither allocates nor
-# makes system calls, so this does not undo the no-heap property above; check
-# it with nm if you change it. Must follow the objects on the link line.
+# The filter design needs sin, cos and pow, the AGC setup needs pow and exp, and
+# the telemetry needs log10. Newlib's libm neither allocates nor makes system
+# calls, so this does not undo the no-heap property above; check it with nm if
+# you change it. Must follow the objects on the link line.
 FW_LIBS := -lm
 
 FW_OBJ    := $(FW_SRC:%.c=$(FW_BUILD)/%.o) $(FW_ASM:%.s=$(FW_BUILD)/%.o)
@@ -119,16 +120,20 @@ CFLAGS  ?= -std=c99 -Wall -Wextra -Wpedantic -Werror -O2 -Iinc
 SRC      = src/framing.c src/ringbuf.c src/instrument.c
 TEST_SRC = test/test_starter.c
 
-test: build/test_starter build/test_fir_bandpass
+test: build/test_starter build/test_fir_bandpass build/test_agc
 	@cd build && ./test_starter
 	@python3 test/test_roundtrip.py build/stream.bin
 	@./build/test_fir_bandpass
+	@./build/test_agc
 
 build/test_starter: $(SRC) $(TEST_SRC) | build
 	$(CC) $(CFLAGS) $(SRC) $(TEST_SRC) -o $@
 
 build/test_fir_bandpass: src/fir_bandpass.c test/test_fir_bandpass.c | build
 	$(CC) $(CFLAGS) src/fir_bandpass.c test/test_fir_bandpass.c -o $@ -lm
+
+build/test_agc: src/agc.c test/test_agc.c | build
+	$(CC) $(CFLAGS) src/agc.c test/test_agc.c -o $@ -lm
 
 build:
 	@mkdir -p build

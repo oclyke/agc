@@ -10,11 +10,13 @@ a ping-pong buffer; each block is framed by the provided library and sent to
 the host over the ST-LINK virtual com port at 921600 baud, with a status record
 20 times a second. `host/host_receive.py` works against it as-is.
 
-Capture, filter and stream. The bandpass is in the audio path: channel 1 of
-`stereo_capture.wav` is the raw capture and channel 2 is the filtered signal,
-delay-matched so the two line up sample for sample. The gain stage and the AGC
-loop are still missing, so `gain_db` / `rms_in_dbfs` / `rms_out_dbfs` report
-zero. The counters are real, and `worst_block_cycles` now includes the filter.
+Capture, filter, level and stream. The whole chain is in place: channel 1 of
+`stereo_capture.wav` is the raw capture and channel 2 is the bandpassed signal
+with the AGC's gain on it, delay-matched so the two line up sample for sample.
+The loop holds the output at -20 dBFS RMS, drops the gain the instant a block
+asks it to and takes 50 ms to bring it back, and clamps what reaches the
+samples to -20 .. +40 dB. Every field in the telemetry record is now real, and
+`worst_block_cycles` covers the filter and the loop together.
 
 ## Hardware
 
@@ -63,30 +65,33 @@ Then, with `arm-none-eabi-gcc` 13 or later on the path:
 ```sh
 make            # build/firmware/firmware.elf and .bin
 make flash      # program it with openocd
-make test       # native tests: the provided ones, plus the filter's
+make test       # native tests: the provided ones, the filter's, the loop's
 make clean
 ```
 
 `make -f arm_check.mk armcheck` cross-compiles the portable sources on their
-own - the provided library as it did before, and the filter alongside it - with
-no CMSIS, no HAL and no include path beyond `inc/`.
+own - the provided library as it did before, and the filter and the AGC
+alongside it - with no CMSIS, no HAL and no include path beyond `inc/`.
 
 ## Layout
 
 ```
 inc/   framing.h ringbuf.h instrument.h   provided library
        fir_bandpass.h                     bandpass filter
+       agc.h                              the gain stage and the control loop
        board.h                            pin map
        assert_custom.h                    trap macros
        stm32g4xx_hal_conf.h               HAL module selection
 src/   framing.c ringbuf.c instrument.c   provided library
        fir_bandpass.c                     bandpass filter
+       agc.c                              the gain stage and the control loop
        main.c                             clocks, peripherals, capture loop
        interrupt.c                        vector handlers
        syscalls.c                         the two libc hooks the startup needs
        linker.ld
 test/  test_starter.c                     provided native tests
        test_fir_bandpass.c                filter response and streaming tests
+       test_agc.c                         loop dynamics, clamps and timing
 host/  host_receive.py                    provided receiver
 ```
 
@@ -97,7 +102,8 @@ host/  host_receive.py                    provided receiver
   libnosys, so anything reaching for `malloc` fails at link time rather than
   quietly acquiring a heap. `arm-none-eabi-nm build/firmware/firmware.elf`
   shows no allocator in the image. The filter needs `libm` for its design
-  step, which was checked the same way: newlib's math brings no heap with it.
+  step, the AGC for its setup and the telemetry for its logarithms, all of
+  which were checked the same way: newlib's math brings no heap with it.
 - Peripheral setup uses the HAL; the DMA and timing paths are written directly.
 
 ## Notes
@@ -115,6 +121,14 @@ host/  host_receive.py                    provided receiver
   that `inc/framing.h` defines, which `host_receive.py` writes to
   `telemetry.csv`. If a check trips, the firmware parks with `trap_file` and
   `trap_line` set - read those first under a debugger.
+
+  The three levels in that record all describe the same block, the one the AGC
+  last emitted. `rms_in_dbfs` is measured at the loop's own measurement point -
+  after the filter, before the gain - rather than on channel 1, which still
+  carries the rumble, the alias and the residual DC; measured there,
+  `rms_out_dbfs - rms_in_dbfs` is `gain_db` in the steady state. The three
+  separate when the loop is moving, because the block was scaled by a ramp
+  rather than by a constant and `gain_db` is only where that ramp finished.
 - **Sample clock on a pin.** PB5 toggles in the TIM6 update interrupt, so a
   scope on it shows a 4 kHz square wave whose edges are the sample instants
   (the conversion starts a few ADC clocks after the edge and takes ~6 us).
@@ -137,22 +151,79 @@ host/  host_receive.py                    provided receiver
   bandpass has two error terms that can add. The library designs for 6 dB more
   than asked to cover that, which is where 217 comes from.
 
-- **Delay matching.** The filter delays every frequency alike by 108 samples,
-  13.5 ms. `main.c` runs the raw channel through a delay line of exactly that
-  length before framing it, so the two channels of `stereo_capture.wav`
-  describe the same instant - otherwise comparing them, by ear or by the host
-  or by a level detector, compares two different moments. The alignment is
-  measured rather than assumed: `test_fir_bandpass.c` sweeps the shift and
-  checks that 108 is where an in-band signal reconstructs to -78 dB and that
-  107 and 109 are both far worse, so an off-by-one cannot pass quietly.
+- **AGC.** `inc/agc.h`, block-rate, driven by the RMS of each block of the
+  filtered signal. It holds the output at -20 dBFS with the gain that reaches
+  the samples clamped to -20 .. +40 dB, both from the brief.
 
-- **Clipping.** The filter is unity gain to a tone in the passband, but its
-  worst-case gain to an arbitrary waveform is the sum of the magnitudes of its
-  coefficients, which for this band is 2.92 - about 9.3 dB above full scale.
-  Real audio does not go near that, but `main.c` saturates the filtered channel
-  rather than letting it wrap, so an overload sounds like clipping instead of
-  like noise. Nothing counts those saturations yet; that belongs with the gain
-  stage.
+  Three things about the shape of it are worth stating.
+
+  *It holds a block back.* The gain that a block's ramp ends on is the gain the
+  block AFTER it asked for, so the loop has 8 ms of lookahead: a reduction has
+  finished ramping by the time the loud audio that caused it arrives. That is
+  the extra 64 samples in the delay line above.
+
+  *Down at once, up over 50 ms.* The brief suggests something like 10 ms down
+  and 150 ms up. Reductions here take no time at all - with the lookahead there
+  is nothing to be gained by smoothing them - and recoveries follow
+  `g += a*(target - g)`. `a` is a per-sample coefficient, `1 - exp(-1/(tau*fs))`,
+  which is 0.002496 for 50 ms at 8 kHz. The gain is a per-block quantity, so
+  applying that number once a block would give a time constant 64 times too
+  long, 3.2 seconds; `agc_init()` folds a whole block of the recursion into one
+  coefficient, `1 - (1-a)^64 = 0.1478`, instead. `test_agc.c` does not take
+  that on trust - it recovers the time constant from the measured gain
+  trajectory and gets 50.1 ms, and separately compares the whole run against a
+  reference that steps the recursion one sample at a time.
+
+  *The gain never steps.* Every sample gets its own gain, one linear
+  interpolation step apart, and the line is continuous across block boundaries
+  because each block starts from the value the last one ended on. The position
+  along the line is computed per sample rather than accumulated: accumulating
+  is one instruction cheaper and drifts, and on a ramp starting high and ending
+  low the drift reached a few parts in ten thousand of the endpoint, which is a
+  step in the gain at every block boundary. Measured, and now asserted at a
+  single rounding.
+
+  What the clamp does not do is bound the gain STATE - only what multiplies the
+  samples. On silence the state releases up past the ceiling while the applied
+  gain sits pinned on it. That needs no anti-windup because the attack is
+  immediate: the first block of real audio asks for less gain than the state
+  holds, so the state lands on the new value in one block from wherever it had
+  drifted to, rather than having to unwind.
+
+  The one place the lookahead costs rather than pays is a sudden drop in level:
+  the block being emitted is still the loud one, and its ramp is aimed at the
+  much higher gain the quiet block behind it asked for. It is bounded - one
+  release step, so at most 14.8% of the way to the new gain - and it lasts
+  exactly one block. On a 39 dB instantaneous step, which no microphone will
+  produce, one 8 ms block comes out at -1.3 dBFS. It saturates rather than
+  wrapping.
+
+- **Delay matching.** Two delays have to be made up on the raw channel, not
+  one. The filter delays every frequency alike by 108 samples, 13.5 ms, and the
+  AGC holds a block back so its ramp can be aimed by the block that follows,
+  which is another 64. `main.c` runs the raw channel through a delay line of
+  exactly 172 samples before framing it, so the two channels of
+  `stereo_capture.wav` describe the same instant - otherwise comparing them, by
+  ear or by the host or by a level detector, compares two different moments.
+
+  Both halves are measured rather than assumed. `test_fir_bandpass.c` sweeps
+  the shift and checks that 108 is where an in-band signal reconstructs to
+  -78 dB and that 107 and 109 are both far worse; `test_agc.c` checks that what
+  comes out of the loop is the previous block's samples and not this one's. An
+  off-by-one in either cannot pass quietly.
+
+- **Clipping.** `main.c` saturates the output channel rather than letting it
+  wrap, so an overload sounds like clipping instead of like noise, and counts
+  the samples it had to hold at a rail in `output_clips`. There is no field for
+  that count in the telemetry record - `PROTOCOL.md` fixes the layout - so read
+  it under a debugger, or look for the flat tops in channel 2.
+
+  Two things can push a sample past the rail. The filter is unity gain to a
+  tone in the passband, but its worst-case gain to an arbitrary waveform is the
+  sum of the magnitudes of its coefficients, which for this band is 2.92, about
+  9.3 dB above full scale; real audio does not go near that. The AGC is the
+  likelier source, because it aims its gain at an RMS level and any crest
+  factor at all puts peaks above the target.
 
 - **Aliasing.** Worth flagging: at 8 kHz Nyquist is 4 kHz, and there is no
   analogue anti-alias filter between the MAX4466 and the ADC. The high tone in
