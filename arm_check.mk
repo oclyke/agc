@@ -11,7 +11,8 @@ ARMCC    := $(CROSS)gcc
 MCU      := -mcpu=cortex-m4 -mthumb -mfpu=fpv4-sp-d16 -mfloat-abi=hard
 ARMFLAGS := -std=c99 -Wall -Wextra -Wpedantic -Werror -O2 -ffunction-sections \
             -DUSE_DWT_CYCCNT -Iinc
-ARM_SRC  := src/framing.c src/ringbuf.c src/instrument.c test/arm_smoke.c
+ARM_SRC  := src/framing.c src/ringbuf.c src/instrument.c src/fir_bandpass.c \
+            test/arm_smoke.c
 
 .PHONY: armcheck
 armcheck:
