@@ -71,6 +71,9 @@
 /** Status record cadence, per the brief: 20 a second. */
 #define TELEMETRY_INTERVAL_MS (50)
 
+/** Heartbeat LED cadence. */
+#define HEARTBEAT_INTERVAL_MS (500)
+
 /**
  * Drive the sample clock out on a pin, for a scope.
  *
@@ -551,68 +554,74 @@ int main(void) {
   static int16_t stream_block[CAPTURE_BLOCK_SAMPLES];
   static uint8_t stream_frame[AUDIO_FRAME_BYTES];
 
-  uint32_t heartbeat_blocks = 0;
   uint32_t sequence = 0;
   uint32_t telemetry_due_ms = HAL_GetTick();
+  uint32_t heartbeat_due_ms = HAL_GetTick();
 
   while (1) {
-    while (!capture_block_ready) {
-      /* The block period is the only clock this loop runs on, so the wait is
-       * where the stream gets drained. */
-      stream_pump();
-    }
-
-    const volatile int16_t* block = &capture_buffer[capture_block_offset];
-    capture_block_ready = false;
-
-    BLOCK_TIMER_START();
-    /* The filter, the gain stage and the AGC loop belong here. Until they
-     * exist the captured block is sent as both channels, so the two halves of
-     * the stereo capture are identical and the link can be judged on its own.
-     *
-     * The conversion result is 12 bit signed and the host reads samples as
-     * int16, so it is scaled to full scale on the way out. Without this every
-     * level the host reports would be 24 dB low, which would make the trim pot
-     * calibration in the brief actively misleading. Multiply rather than
-     * shift: a left shift of a negative value is not defined before C23. */
-    for (size_t idx = 0; idx < CAPTURE_BLOCK_SAMPLES; idx++) {
-      stream_block[idx] = (int16_t)(block[idx] * 16);
-    }
-
-    const size_t audio_bytes = frame_audio(stream_frame, sizeof(stream_frame),
-                                           sequence, stream_block, stream_block);
-    BLOCK_TIMER_END();
-
-    sequence++;
-    stream_send(stream_frame, audio_bytes);
-
     const uint32_t now_ms = HAL_GetTick();
-    if ((int32_t)(now_ms - telemetry_due_ms) >= 0) { // signed difference, so the tick wrap is harmless
-      telemetry_due_ms = now_ms + TELEMETRY_INTERVAL_MS;
 
-      telem_t telemetry;
-      memset(&telemetry, 0, sizeof(telem_t));
-
-      telemetry.timestamp_ms = now_ms;
-      /* gain_db and the two RMS levels stay zero until there is a gain stage
-       * to report. The counters below are real. */
-      telemetry.worst_block_cycles = g_counters.worst_cycles;
-      telemetry.dma_overruns = g_counters.dma_overruns;
-      telemetry.adc_overruns = g_counters.adc_overruns;
-      telemetry.stream_drops = g_counters.stream_drops;
-      telemetry.blocks_processed = g_counters.blocks;
-
-      stream_send(stream_frame, frame_telem(stream_frame, sizeof(stream_frame), &telemetry));
-    }
-
-    /* Also pump here, so draining does not depend on the loop having idle
-     * time to spare. */
+    /* Non-blocking drive of UART data. */
     stream_pump();
 
-    heartbeat_blocks++;
-    if (heartbeat_blocks >= HEARTBEAT_BLOCKS) {
-      HAL_GPIO_TogglePin(LED_PORT, LED_PIN);
-      heartbeat_blocks = 0;
+    if (capture_block_ready) {
+      const volatile int16_t* block = &capture_buffer[capture_block_offset];
+      capture_block_ready = false;
+
+      BLOCK_TIMER_START();
+      /* The filter, the gain stage and the AGC loop belong here. Until they
+      * exist the captured block is sent as both channels, so the two halves of
+      * the stereo capture are identical and the link can be judged on its own.
+      *
+      * The conversion result is 12 bit signed and the host reads samples as
+      * int16, so it is scaled to full scale on the way out. Without this every
+      * level the host reports would be 24 dB low, which would make the trim pot
+      * calibration in the brief actively misleading. Multiply rather than
+      * shift: a left shift of a negative value is not defined before C23. */
+      for (size_t idx = 0; idx < CAPTURE_BLOCK_SAMPLES; idx++) {
+        stream_block[idx] = (int16_t)(block[idx] * 16);
+      }
+
+      const size_t audio_bytes = frame_audio(stream_frame, sizeof(stream_frame),
+                                            sequence, stream_block, stream_block);
+      BLOCK_TIMER_END();
+
+      sequence++;
+      stream_send(stream_frame, audio_bytes);
+    }
+
+    /**
+     * @section Emit telemetry periodically.
+     * 
+     */
+    {
+      if ((int32_t)(now_ms - telemetry_due_ms) >= 0) { // signed difference, so the tick wrap is harmless
+        telemetry_due_ms = now_ms + TELEMETRY_INTERVAL_MS;
+
+        telem_t telemetry;
+        memset(&telemetry, 0, sizeof(telem_t));
+
+        telemetry.timestamp_ms = now_ms;
+        /* gain_db and the two RMS levels stay zero until there is a gain stage
+        * to report. The counters below are real. */
+        telemetry.worst_block_cycles = g_counters.worst_cycles;
+        telemetry.dma_overruns = g_counters.dma_overruns;
+        telemetry.adc_overruns = g_counters.adc_overruns;
+        telemetry.stream_drops = g_counters.stream_drops;
+        telemetry.blocks_processed = g_counters.blocks;
+
+        stream_send(stream_frame, frame_telem(stream_frame, sizeof(stream_frame), &telemetry));
+      }
+    }
+
+    /**
+     * @section Drive heartbeat LED.
+     */
+    {
+      if ((int32_t)(now_ms - heartbeat_due_ms) >= 0) {
+        HAL_GPIO_TogglePin(LED_PORT, LED_PIN);
+        heartbeat_due_ms = now_ms + HEARTBEAT_INTERVAL_MS;
+      }
     }
   }
 }
